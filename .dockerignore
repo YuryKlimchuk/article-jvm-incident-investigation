@@ -1,0 +1,11 @@
+.git
+.idea
+.pi
+target
+openspec
+docs
+infra
+artifacts
+HELP.md
+README.md
+*.md

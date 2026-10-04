@@ -1,0 +1,26 @@
+# TODO
+
+Задачи, которые нужно держать в голове по ходу серии.
+
+## Перепроверка по частям: код + дашборды Grafana
+
+Код демо-приложения (`src/main/java/.../incident/`) и дашборды Grafana (`infra/grafana/dashboards/`) на текущий момент проверены **поверхностно** — приложение собралось и запустилось, дашборды созданы. Перед написанием каждой части перепроверять **и код инцидента, и соответствующий дашборд**:
+
+| Часть | Инцидент | Дашборд | Что перепроверить |
+|---|---|---|---|
+| Part 1 | `cpu` | `01-cpu.json` | busy-loop реально грузит CPU, `fix`/`stop` останавливают; на дашборде растёт process/container CPU |
+| Part 2 | `allocation` | `02-allocation.json` | темп аллокаций виден, churn реалистичен; allocation rate на дашборде растёт |
+| Part 3 | `gc` | `03-gc.json` | GC pressure и паузы воспроизводимы; GC frequency/pause на дашборде растут |
+| Part 4 | `memory-leak` | `04-memory-leak.json` | утечка реально растёт, `stop` очищает; heap used растёт на дашборде |
+| Part 5 | `native-memory` | `05-native-memory.json` | RSS растёт, direct buffers освобождаются; RSS на дашборде растёт при стабильном heap |
+| Part 6 | `deadlock`/`threads` | `06-threads.json` | deadlock воспроизводим, потоки создаются/останавливаются; threads по состояниям на дашборде |
+| Part 7 | `blocking-io` | `07-blocking-io.json` | WireMock задержка + блокирующие вызовы; waiting/blocked threads растут (проверить `http_client_*`) |
+| Part 8 | `db-pool` | `08-db-pool.json` | пул исчерпывается, соединения возвращаются; HikariCP active/pending и PG connections на дашборде |
+
+## `/fix`-ручки
+
+Проверить в конце: действительно ли нужны `/fix`-ручки (показывают «до/после» в живом приложении) или фикс достаточно показать кодом в статье. Решение с обоснованием зафиксировать.
+
+## Открытые метрики
+
+- `http_client_requests_seconds` для Part 7 может быть пустым: `RestClient.create()` не инструментируется автоматически. Перепроверить при написании Part 7 (возможно, завести `RestClient.Builder` bean).
