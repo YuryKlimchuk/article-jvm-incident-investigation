@@ -1,3 +1,21 @@
 spring:
   application:
     name: jvmincidents
+  datasource:
+    url: ${DB_URL:jdbc:postgresql://localhost:5432/jvmincidents}
+    username: ${DB_USER:postgres}
+    password: ${DB_PASSWORD:postgres}
+    hikari:
+      maximum-pool-size: 10
+      initialization-fail-timeout: -1   # лениво: приложение стартует без БД
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics,prometheus
+
+incidents:
+  blocking-io:
+    downstream-url: ${WIREMOCK_URL:http://localhost:8082}/api/slow
+    wiremock-admin-url: ${WIREMOCK_ADMIN_URL:http://localhost:8082}
