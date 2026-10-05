@@ -38,6 +38,10 @@ scripts/incidents.sh start cpu
 
 Важно не путать два семейства метрик: `process_cpu_usage` и `system_cpu_usage` — это **доли** (CPU, занятый процессом/системой, относительно доступного), а `container_cpu_usage_seconds_total` — **накопительный счётчик** CPU-секунд контейнера, из которого `rate(...)` даёт **занятые ядра**. Поэтому «0.17» у process-метрики и «доля ядра» у container-метрики — одно и то же явление в разных единицах.
 
+Вот как это выглядит на живом дашборде — полный цикл инцидента: baseline → резкий рост → плато → возврат к baseline:
+
+![Дашборд Part 1 — CPU Profiling во время инцидента](img/grafana-01-cpu-spike.png)
+
 ## Вопрос
 
 Теперь формулируем вопрос по методике из Part 0. Симптом — «высокий CPU». Вопрос — **«какой код его жжёт?»**.
@@ -56,20 +60,22 @@ jcmd 1 Thread.print > /artifacts/threads.txt
 В дампе сразу видно двух виновников:
 
 ```text
-"cpu-burner-0" #41 daemon prio=5 os_prio=0 cpu=... tid=0x... nid=0x...
+"cpu-burner-0" #56 daemon prio=5 os_prio=0 cpu=493566.51ms elapsed=494.05s ... nid=60 runnable
    java.lang.Thread.State: RUNNABLE
-	at com.hydroyura.article.jvmincidents.incident.cpu.CpuIncident.lambda$doStart$0(CpuIncident.java:~42)
-	...
-	at java.lang.Thread.run(Thread.java:...)
+	at com.hydroyura.article.jvmincidents.incident.cpu.CpuIncident.lambda$doStart$0(CpuIncident.java:37)
+	at com.hydroyura.article.jvmincidents.incident.cpu.CpuIncident$$Lambda/0x000000009e795348.run(Unknown Source)
+	at java.lang.Thread.runWith(java.base@25.0.4.1/Thread.java:1487)
+	at java.lang.Thread.run(java.base@25.0.4.1/Thread.java:1474)
 
-"cpu-burner-1" #42 daemon prio=5 os_prio=0 cpu=... tid=0x... nid=0x...
+"cpu-burner-1" #57 daemon prio=5 os_prio=0 cpu=493581.19ms elapsed=494.05s ... nid=61 runnable
    java.lang.Thread.State: RUNNABLE
-	at com.hydroyura.article.jvmincidents.incident.cpu.CpuIncident.lambda$doStart$0(CpuIncident.java:~42)
-	...
-	at java.lang.Thread.run(Thread.java:...)
+	at com.hydroyura.article.jvmincidents.incident.cpu.CpuIncident.lambda$doStart$0(CpuIncident.java:37)
+	at com.hydroyura.article.jvmincidents.incident.cpu.CpuIncident$$Lambda/0x000000009e795348.run(Unknown Source)
+	at java.lang.Thread.runWith(java.base@25.0.4.1/Thread.java:1487)
+	at java.lang.Thread.run(java.base@25.0.4.1/Thread.java:1474)
 ```
 
-Два потока `cpu-burner-*` в состоянии `RUNNABLE`, оба крутятся в одном и том же лямбда-методе. Это уже сильная зацепка: проблема локализована до одного метода. Но thread dump — это мгновенный снимок, он не говорит, *сколько* CPU жрёт каждый метод. Для этого нужен профайлер.
+Два потока `cpu-burner-*` в состоянии `RUNNABLE`, оба крутятся в одном и том же лямбда-методе. Смотрим на поле `cpu=` в шапке потока: у каждого `~493 566 ms` при `elapsed=494 s` — отношение `cpu/elapsed ≈ 1.0` означает, что поток непрерывно жжёт одно полное ядро. У всех остальных потоков `cpu=` — единицы миллисекунд. Проблема локализована до одного метода. Но thread dump — это мгновенный снимок, он не говорит, *сколько* CPU жрёт метод относительно остального кода в каждый момент. Для этого нужен профайлер.
 
 ## Диагностика 2: async-profiler (flame graph)
 
@@ -81,19 +87,53 @@ async-profiler уже лежит в образе (`/opt/async-profiler`). Сни
 docker exec app /opt/async-profiler/bin/asprof -d 30 -f /artifacts/cpu.html 1
 ```
 
-Открываем `artifacts/cpu.html` — это flame graph. Внизу — корень стека (`Thread.run`), а наша лямбда из `CpuIncident` — широкая рамка в середине: над ней узкие листья `Math.sin`/`Math.cos`, под ней `Thread.run`. Ширина рамки = доля CPU-времени, и она огромная — всё время сконцентрировано в одном месте. Классическая картина busy-loop.
+Открываем `artifacts/cpu.html` — это flame graph. Ось X — доля CPU-времени (ширина рамки), ось Y — глубина стека: внизу корень (`Thread.run`), выше — вложенные вызовы, на самом верху — листья. Наша лямбда из `CpuIncident` — широкая рамка почти во всю ширину, над ней узкие листья `Math.sin`/`Math.cos`. Если вытащить те же данные текстом (5 989 сэмплов за 30 секунд):
+
+```text
+all                                    — 5 989 (100.0%)
+  java/lang/Thread.run                 — 5 989 (100.0%)
+    java/lang/Thread.runWith           — 5 989 (100.0%)
+      CpuIncident$$Lambda...run        — 5 989 (100.0%)
+        CpuIncident.lambda$doStart$0   — 5 989 (100.0%)   ← busy-loop
+          cos                          — 2 845 (47.5%)
+          sin                          — 2 684 (44.8%)
+```
+
+Весь CPU сидит в `lambda$doStart$0`; внутри него почти поровну `sin` и `cos`, а оставшиеся ~460 сэмплов (7.7%) — накладные расходы самого цикла (`running.get()`, `acc +=`). Классическая картина busy-loop: одно гигантское плато вместо «городского пейзажа» из множества разных методов.
 
 > В контейнере async-profiler требует прав на perf-события — в нашем docker-compose это уже настроено (`SYS_ADMIN` для perf-событий, `SYS_PTRACE` для attach). На хосте реальный блокер обычно не capabilities, а `kernel.perf_event_paranoid`: на современных дистрибутивах он ограничивает доступ непривилегированных процессов к perf-событиям. Если perf недоступен — фолбэк на JFR.
 
 ## Диагностика 3: JFR (hot methods)
 
-async-profiler показал *где*, но не *когда*. JFR — это не просто запасной вариант, а другой тип данных: встроенный в JVM event-based рекордер с почти нулевым оверхедом. Он даёт таймлайн и позволяет коррелировать CPU-всплеск с GC и safepoint-событиями. Снимем запись и посмотрим в JMC, в какой момент началась нагрузка:
+async-profiler показал *где*, но не *когда*. JFR — это не просто запасной вариант, а другой тип данных: встроенный в JVM event-based рекордер с почти нулевым оверхедом. Он даёт таймлайн и позволяет коррелировать CPU-всплеск с GC и safepoint-событиями (safepoint — момент, когда JVM останавливает все потоки для stop-the-world операций: GC, деоптимизация, тот же thread dump). Снимем запись:
 
 ```bash
 docker exec app jcmd 1 JFR.start duration=60s filename=/artifacts/recording.jfr
 ```
 
-Открываем `recording.jfr` в JMC → раздел **Hot Methods**. Тот же результат: наш лямбда-метод на первом месте. JFR подтверждает вывод профайлера и добавляет контекст во времени — видно, когда именно началась нагрузка.
+Смотрим hot methods прямо из терминала (без GUI — та же картина текстом):
+
+```bash
+docker exec app jfr view hot-methods /artifacts/recording.jfr
+```
+
+```text
+                    Java Methods that Execute the Most
+
+Method                                                        Samples  Percent
+CpuIncident.lambda$doStart$0()                                   5 952   99.97%
+jdk.jfr.internal.PlatformRecorder.isToDisk()                         1    0.02%
+java.util.Collections$UnmodifiableCollection$1.next()                1    0.02%
+```
+
+Тот же результат: наш лямбда-метод на первом месте с **99.97%**. Заодно проверяем, что CPU — это не GC и не работа самой JVM:
+
+```bash
+docker exec app jfr view gc /artifacts/recording.jfr            # No events → GC не было
+docker exec app jfr view vm-operations /artifacts/recording.jfr # 1 операция (36 мс) за минуту
+```
+
+GC не происходил, stop-the-world операций почти нет — значит, CPU жжёт именно наш код, а не сама JVM.
 
 ## Первопричина
 
