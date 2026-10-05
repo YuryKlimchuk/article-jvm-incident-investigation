@@ -35,7 +35,7 @@
       "title": "Container CPU (app)",
       "datasource": { "type": "prometheus", "uid": "prometheus" },
       "targets": [
-        { "refId": "A", "expr": "sum(rate(container_cpu_usage_seconds_total{name=\"app\"}[5m]))", "legendFormat": "app cpu (cores)" }
+        { "refId": "A", "expr": "sum(rate(container_cpu_usage_seconds_total{container_label_com_docker_compose_service=\"app\"}[5m]))", "legendFormat": "app cpu (cores)" }
       ],
       "fieldConfig": { "defaults": { "unit": "percentunit" }, "overrides": [] },
       "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 }

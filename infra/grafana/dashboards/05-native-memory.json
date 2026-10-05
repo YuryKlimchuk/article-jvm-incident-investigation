@@ -13,7 +13,7 @@
       "title": "Container RSS (app)",
       "datasource": { "type": "prometheus", "uid": "prometheus" },
       "targets": [
-        { "refId": "A", "expr": "container_memory_rss{name=\"app\"}", "legendFormat": "RSS" }
+        { "refId": "A", "expr": "container_memory_rss{container_label_com_docker_compose_service=\"app\"}", "legendFormat": "RSS" }
       ],
       "fieldConfig": { "defaults": { "unit": "bytes" }, "overrides": [] },
       "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 }
