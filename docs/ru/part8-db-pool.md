@@ -1,0 +1,199 @@
+# JVM Incident Investigation: Part 8 — Connection Pool Exhaustion
+
+Запросы встают в очередь, а база при этом почти не нагружена. HikariCP упирается в потолок: активных соединений — максимум, свободных — ноль, и два потока ждут соединение. Это последняя часть серии, и она закрывает цепочку, к которой нас подводил Part 7: блокирующий I/O → исчерпание потоков → исчерпание пула соединений.
+
+У нас есть демо-приложение с «красной кнопкой»: ручка, которая запускает 12 потоков, берущих соединения из HikariCP и не возвращающих их. Пройдём весь путь — с реальными метриками и SQL-запросом.
+
+## Симптом: HikariCP у потолка
+
+Включаем проблему:
+
+```bash
+scripts/incidents.sh start db-pool
+```
+
+Ответ:
+
+```json
+{ "type": "db-pool", "status": "active", "description": "проблема активирована" }
+```
+
+Смотрим метрики HikariCP (`/actuator/prometheus`):
+
+```text
+hikaricp_connections_active{pool="HikariPool-1"}   10.0   ← пул исчерпан
+hikaricp_connections_idle{pool="HikariPool-1"}      0.0   ← свободных нет
+hikaricp_connections_pending{pool="HikariPool-1"}   2.0   ← потоки ждут соединение
+hikaricp_connections_max{pool="HikariPool-1"}      10.0
+```
+
+Пул размером 10 полностью занят, свободных ноль, и ещё 2 потока стоят в очереди за соединением. Если пул не освободится за `connectionTimeout` (по умолчанию 30 секунд), эти ожидающие потоки упадут с ошибкой, а счётчик `hikaricp_connections_timeout_total` начнёт расти.
+
+Это сигнатура исчерпания пула: **соединения есть, но все заняты, и новые запросы не могут их получить**.
+
+## Дашборд: Part 8 — Connection Pool Exhaustion
+
+Карта наблюдения — четыре панели:
+
+| Панель | Метрика | Что показывает | Что ждём при инциденте |
+|---|---|---|---|
+| HikariCP active connections | `hikaricp_connections_active` | занятые соединения | растёт к максимуму (10) |
+| HikariCP pending connections | `hikaricp_connections_pending` | потоки в очереди за соединением | > 0 — запросы ждут |
+| HikariCP timeouts | `hikaricp_connections_timeout_total` | счётчик таймаутов получения соединения | растёт, когда очередь не рассасывается |
+| PostgreSQL connections | `sum(pg_stat_activity_count)` | соединения на стороне БД | растёт до размера пула |
+
+Первые три панели рассказывают историю целиком: active упирается в потолок, pending показывает, что кто-то ждёт, timeouts — что ожидание переходит в ошибки. Четвёртая панель связывает это с БД: сколько соединений реально открыто на стороне PostgreSQL.
+
+## Вопрос
+
+Симптом — «пул исчерпан». По методике из Part 0 формулируем вопрос: **«почему соединения не возвращаются в пул?»**.
+
+Причин ровно три, и от них зависит фикс:
+
+- **медленный SQL** — соединение легитимно занято выполнением долгого запроса;
+- **зависшая транзакция** — соединение открыто и висит в `idle in transaction`;
+- **забытый close / утечка** — соединение взяли и не вернули.
+
+Различить их помогает не HikariCP (он знает только «занято»), а взгляд на сторону БД — `pg_stat_activity`.
+
+## Диагностика: метрики HikariCP
+
+Метрики пула уже показали «всё занято». Зафиксируем числа:
+
+```bash
+curl -s localhost:8080/actuator/prometheus | grep hikaricp_connections
+```
+
+```text
+hikaricp_connections_active{pool="HikariPool-1"}   10.0
+hikaricp_connections_pending{pool="HikariPool-1"}   2.0
+hikaricp_connections_timeout_total{pool="HikariPool-1"}  0.0
+```
+
+`active=10` при `max=10` и `pending=2` — пул на пределе. Но HikariCP не скажет, *чем* заняты эти 10 соединений. Идём в БД.
+
+## Диагностика: pg_stat_activity
+
+Смотрим, что происходит на стороне PostgreSQL:
+
+```sql
+SELECT pid, state, wait_event_type, left(query, 40) AS query
+FROM pg_stat_activity
+WHERE datname = 'jvmincidents'
+ORDER BY state;
+```
+
+```text
+ pid  | state | wait_event_type |                  query
+------+-------+-----------------+------------------------------------------
+11616 | idle  | Client          | SET application_name = 'PostgreSQL JDBC …
+11617 | idle  | Client          | SET application_name = 'PostgreSQL JDBC …
+… (ещё 8 строк) …
+11615 | idle  | Client          | SHOW TRANSACTION ISOLATION LEVEL
+```
+
+10 соединений в состоянии `idle` с `wait_event_type = Client` (точнее `ClientRead` — БД ждёт пакет от клиента). Само по себе `idle` для пула — норма: свободные соединения в пуле тоже `idle`. Улика именно в **рассинхроне**: HikariCP считает эти 10 соединений `active` (выданными), а PostgreSQL видит их `idle` (ничего не делающими). Значит, приложение взяло соединение и держит его, не используя, — это и есть утечка.
+
+Расшифровка состояний:
+
+- `active` — соединение реально выполняет запрос → это медленный SQL.
+- `idle in transaction` — транзакция открыта, но ничего не делает → зависшая транзакция (например, `@Transactional` вокруг внешнего вызова).
+- `idle` (+ `wait_event_type=Client`) — соединение ждёт клиента → **забытый close / утечка**.
+
+У нас третий случай. Это и есть первопричина.
+
+## Первопричина
+
+Смотрим код инцидента:
+
+```java
+for (int i = 0; i < threadCount; i++) {        // threadCount = 12
+    Thread t = new Thread(() -> {
+        try {
+            Connection conn = dataSource.getConnection();
+            synchronized (heldConnections) {
+                heldConnections.add(conn);
+            }
+            while (running.get()) {
+                Thread.sleep(1000);             // удерживаем соединение
+            }
+        } catch (Exception e) {
+            // пул исчерпан или БД недоступна
+        }
+    }, "db-pool-holder-" + i);
+    t.setDaemon(true);
+    t.start();
+}
+```
+
+12 потоков `db-pool-holder-*` берут соединение из пула (размером 10) и просто держат его, «спя» в цикле. Первые 10 получают соединения и не возвращают их; оставшиеся 2 встают в очередь (`pending=2`). Соединение берётся и **никогда не возвращается** в пул через `close()` — классическая утечка соединений.
+
+В проде это выглядит как угодно: забытый `finally { conn.close() }`, утечка на исключении, соединение, удерживаемое в поле объекта, который живёт вечно. Суть одна — **соединение взяли и не вернули**, и пул со временем исчерпывается.
+
+## Фикс и проверка
+
+Выключаем проблему:
+
+```bash
+scripts/incidents.sh fix db-pool
+scripts/incidents.sh stop db-pool
+```
+
+`fix`/`stop` останавливают потоки и вызывают `conn.close()` для всех удерживаемых соединений. Проверяем:
+
+```text
+hikaricp_connections_active{pool="HikariPool-1"}   0.0   ← всё вернулось
+hikaricp_connections_idle{pool="HikariPool-1"}    10.0   ← соединения снова свободны
+hikaricp_connections_pending{pool="HikariPool-1"}  0.0   ← очередь рассосалась
+```
+
+Метрики вернулись к норме. Проверка пройдена: проблема была именно в утечке соединений, а не в медленном SQL или нехватке пула.
+
+В реальном коде фикс — это гарантировать возврат соединения: `try-with-resources` вокруг `getConnection()`, закрывать соединение в `finally`, не держать его в долгоживущих объектах. А размер пула поднимать — только после того, как доказано, что соединения не утекают. Кстати, HikariCP умеет ловить такие утечки сам: `leakDetectionThreshold` заставляет его логировать стек-трейс, если соединение не возвращено в пул дольше порога.
+
+## Связь с Part 7 и отличие от Part 6
+
+Три последние части — про «запросы встали», но ограниченный ресурс у каждой свой:
+
+| | Part 6 deadlock | Part 7 blocking I/O | Part 8 pool exhaustion |
+|---|---|---|---|
+| Что ограничено | мониторы (локи) | потоки | соединения пула |
+| Состояние потока | `BLOCKED` | `WAITING (parking)` | `WAITING` (в очереди за коннектом) |
+| Инструмент | thread dump | thread dump / JFR | HikariCP metrics + `pg_stat_activity` |
+| Фикс | порядок локов | таймауты/async | возврат соединений |
+
+Part 7 подводил к Part 8 напрямую: блокирующие вызовы занимают потоки, а если блокирующий вызов происходит после получения соединения (например, внутри транзакции) — те же потоки держат и соединения пула, и вот пул исчерпан.
+
+## Итоги серии
+
+Восемь частей — восемь симптомов, и у каждого свой «растущий ресурс» и свой инструмент:
+
+| Часть | Симптом | Ключевой инструмент |
+|---|---|---|
+| Part 1 | High CPU | async-profiler (cpu) / JFR |
+| Part 2 | High allocation rate | async-profiler (alloc) / JFR |
+| Part 3 | Frequent GC pauses | GC-логи / JFR |
+| Part 4 | Growing heap (leak) | heap dump + MAT |
+| Part 5 | High RSS, heap OK | NMT |
+| Part 6 | Deadlock / blocked threads | thread dump |
+| Part 7 | Blocking I/O | thread dump / JFR |
+| Part 8 | Connection pool exhaustion | HikariCP metrics + pg_stat_activity |
+
+Сквозная идея всей серии — та же, что в Part 0: **сначала симптом, потом вопрос, потом инструмент**. Не хвататься за профайлер по умолчанию, а по наблюдаемому признаку сузить проблему до конкретного вопроса и выбрать инструмент, который на него отвечает.
+
+## Что мы сделали
+
+Полный алгоритм из Part 0 на конкретном инциденте:
+
+```
+симптом (HikariCP у потолка, pending растёт)
+→ вопрос (почему соединения не возвращаются?)
+→ HikariCP metrics (active/pending/timeout)
+→ pg_stat_activity (idle + wait_event_type=Client → утечка)
+→ первопричина (соединения берутся и не закрываются)
+→ fix + проверка (close → метрики вернулись)
+```
+
+Ключевой урок финальной части: **когда пул исчерпан — смотрите на сторону БД**. `pg_stat_activity` одним запросом отличает медленный SQL (`active`), зависшую транзакцию (`idle in transaction`) от утечки (`idle`), и это сразу указывает правильный фикс.
+
+На этом серия «JVM Incident Investigation» завершена. Восемь инцидентов, один алгоритм — и набор инструментов, который покрывает самые частые проблемы JVM/Spring-приложений.
